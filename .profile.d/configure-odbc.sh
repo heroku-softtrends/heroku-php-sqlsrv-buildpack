@@ -6,7 +6,7 @@ for f in ${HOME}/.apt/opt/microsoft/*; do
 done
 
 for f in ${HOME}/.apt/usr/lib/*; do 
-	MS_ODBC_DRIVER_FILE=$(echo "$(basename $f)" | grep -o -E '[0-9]+')
+	MS_ODBC_DRIVER_FILE=$(echo "$(basename $f)")
 	break;
 done
 
