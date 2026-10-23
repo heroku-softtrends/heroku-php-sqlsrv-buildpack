@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Test harness helper, following the heroku-buildpack-nodejs bin/compile +
+# bin/test-compile + bin/test convention:
+#   bin/compile       — the real buildpack step, unchanged behavior.
+#   bin/test-compile  — builds one fake .apt/ fixture (simulating what
+#                        heroku-community/apt would have installed from an
+#                        Aptfile) and runs the real bin/compile against it.
+#   bin/test          — the test runner: defines scenarios, calls
+#                        bin/test-compile for each, and asserts the result.
+#
+# Usage:
+#   bin/test-compile <scratch-dir> <msodbcsql-version>... [-- MSODBCSQL_VERSION=<n>]
+#
+# Example:
+#   bin/test-compile /tmp/scratch1 18
+#   bin/test-compile /tmp/scratch2 17 18
+#   bin/test-compile /tmp/scratch3 17 18 -- MSODBCSQL_VERSION=17
+#
+# Prints the resulting BUILD_DIR path on stdout on success. Exits non-zero,
+# with bin/compile's own output on stderr, if the simulated compile fails.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BP_DIR="$(dirname "${SCRIPT_DIR}")"
+
+SCRATCH_DIR=${1:?"usage: bin/test-compile <scratch-dir> <msodbcsql-version>... [-- MSODBCSQL_VERSION=<n>]"}
+shift
+
+VERSIONS=()
+OVERRIDE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --)
+      ;;
+    MSODBCSQL_VERSION=*)
+      OVERRIDE="${1#MSODBCSQL_VERSION=}"
+      ;;
+    *)
+      VERSIONS+=("$1")
+      ;;
+  esac
+  shift
+done
+
+BUILD_DIR="${SCRATCH_DIR}/build"
+mkdir -p "${BUILD_DIR}"
+
+# Build a fake .apt/opt/microsoft/msodbcsql<N> tree per requested version,
+# plus a couple of decoy files already sitting in .apt/usr/lib the way
+# unixODBC's own install would leave them — a buggy "first file in the
+# directory" glob should pick one of these instead of the real driver.
+for v in "${VERSIONS[@]}"; do
+  mkdir -p "${BUILD_DIR}/.apt/opt/microsoft/msodbcsql${v}/lib64"
+  touch "${BUILD_DIR}/.apt/opt/microsoft/msodbcsql${v}/lib64/libmsodbcsql-${v}.0.so.1.1"
+done
+if printf '%s\n' "${VERSIONS[@]:-}" | grep -qx 18; then
+  mkdir -p "${BUILD_DIR}/.apt/opt/microsoft/msodbcsql18/share/resources/en_US"
+  touch "${BUILD_DIR}/.apt/opt/microsoft/msodbcsql18/share/resources/en_US/msodbcsqlr18.rll"
+fi
+mkdir -p "${BUILD_DIR}/.apt/usr/lib"
+touch "${BUILD_DIR}/.apt/usr/lib/aaa_decoy_sorts_first.so"
+touch "${BUILD_DIR}/.apt/usr/lib/libodbc.so.2"
+touch "${BUILD_DIR}/.apt/usr/lib/libodbcinst.so.2"
+
+# bin/compile's own "----->" progress lines go to stderr here so that
+# callers doing BUILD_DIR=$(bin/test-compile ...) get a clean single line
+# of stdout (just the BUILD_DIR path) to capture.
+if [ -n "${OVERRIDE}" ]; then
+  MSODBCSQL_VERSION="${OVERRIDE}" "${BP_DIR}/bin/compile" "${BUILD_DIR}" 1>&2
+else
+  "${BP_DIR}/bin/compile" "${BUILD_DIR}" 1>&2
+fi
+
+echo "${BUILD_DIR}"

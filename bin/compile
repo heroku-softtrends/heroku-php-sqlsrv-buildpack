@@ -1,5 +1,16 @@
-#!/bin/sh
+#!/usr/bin/env bash
+# Copies the Microsoft ODBC driver for SQL Server (installed by the
+# heroku-community/apt buildpack from an Aptfile) into locations that
+# survive into the running dyno, and installs the .profile.d script that
+# wires up odbcinst.ini/odbc.ini at dyno boot.
+#
+# Works for msodbcsql17 and msodbcsql18, on any Ubuntu stack
+# (20.04/22.04/24.04/26.04) — the package layout under /opt/microsoft is the
+# same across all of them. If both 17 and 18 are installed at once, the
+# higher version is used; override with MSODBCSQL_VERSION=17 if you need the
+# other one.
 
+set -euo pipefail
 
 arrow() {
   echo '----->' "$@"
@@ -9,23 +20,77 @@ indent() {
   sed -u 's/^/       /'
 }
 
-BUILD_DIR=$1
+BUILD_DIR=${1:?"usage: bin/compile <build-dir>"}
+APT_DIR="${BUILD_DIR}/.apt"
+MS_DIR="${APT_DIR}/opt/microsoft"
 
-# Get microsoft ODBC diver version
-for f in ${BUILD_DIR}/.apt/opt/microsoft/*; do 
-	MS_ODBC_VERSION=$(echo "$(basename $f)" | grep -o -E '[0-9]+')
-	break;
-done
+if [ ! -d "${MS_DIR}" ]; then
+  arrow "ERROR: ${MS_DIR} not found."
+  echo "       Make sure heroku-community/apt runs BEFORE this buildpack," | indent
+  echo "       and that your Aptfile installs msodbcsql17 or msodbcsql18." | indent
+  exit 1
+fi
 
-arrow "Starting adding ODBC Driver ${MS_ODBC_VERSION} for SQL Server"
-mkdir -p "${BUILD_DIR}/.apt/usr/lib/odbc/conf/" | indent
-mkdir -p "${BUILD_DIR}/.apt/usr/share/resources/en_US/" | indent
-cp -a "${BUILD_DIR}/.apt/opt/microsoft/msodbcsql${MS_ODBC_VERSION}/lib64/." "${BUILD_DIR}/.apt/usr/lib/" | indent
-arrow "copied libmsodbcsql-${MS_ODBC_VERSION}-*"
-cp -a "${BUILD_DIR}/.apt/opt/microsoft/msodbcsql${MS_ODBC_VERSION}/share/resources/en_US/." "${BUILD_DIR}/.apt/usr/share/resources/en_US/" | indent
-arrow "copied msodbcsqlr${MS_ODBC_VERSION}.rll"
+# Pick the ODBC driver version: an explicit override, or the highest
+# msodbcsql<N> version actually installed (so msodbcsql18 wins over 17 if
+# both are present).
+if [ -n "${MSODBCSQL_VERSION:-}" ]; then
+  MS_ODBC_VERSION="${MSODBCSQL_VERSION}"
+  if [ ! -d "${MS_DIR}/msodbcsql${MS_ODBC_VERSION}" ]; then
+    arrow "ERROR: MSODBCSQL_VERSION=${MS_ODBC_VERSION} set, but ${MS_DIR}/msodbcsql${MS_ODBC_VERSION} doesn't exist."
+    exit 1
+  fi
+else
+  # Uses sed (not grep -o) deliberately: with `set -euo pipefail`, grep -o
+  # exits 1 on zero matches and kills this whole pipeline before the
+  # -z "${MS_ODBC_VERSION}" check below ever runs — so a MS_DIR that exists
+  # but has no msodbcsql<N> subdirectory would fail with no error message at
+  # all. sed -n '...p' exits 0 on zero matches, so the empty-string check
+  # below is reached and reports a clear error instead.
+  MS_ODBC_VERSION=$(
+    find "${MS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'msodbcsql[0-9]*' -printf '%f\n' \
+      | sed -nE 's/^msodbcsql([0-9]+)$/\1/p' \
+      | sort -rn \
+      | head -n1
+  )
+fi
+
+if [ -z "${MS_ODBC_VERSION}" ]; then
+  arrow "ERROR: no msodbcsql<N> directory found under ${MS_DIR}."
+  exit 1
+fi
+
+ODBC_PKG_DIR="${MS_DIR}/msodbcsql${MS_ODBC_VERSION}"
+arrow "Starting adding ODBC Driver ${MS_ODBC_VERSION} for SQL Server (from ${ODBC_PKG_DIR})"
+
+# The .deb ships the shared library under lib64/ on every Ubuntu version
+# this repo targets, but fall back to lib/ just in case a future package
+# changes that.
+LIB_SRC="${ODBC_PKG_DIR}/lib64"
+if [ ! -d "${LIB_SRC}" ]; then
+  LIB_SRC="${ODBC_PKG_DIR}/lib"
+fi
+if [ ! -d "${LIB_SRC}" ]; then
+  arrow "ERROR: neither lib64/ nor lib/ found under ${ODBC_PKG_DIR}."
+  exit 1
+fi
+
+mkdir -p "${APT_DIR}/usr/lib/odbc/conf/" | indent
+mkdir -p "${APT_DIR}/usr/share/resources/en_US/" | indent
+
+cp -a "${LIB_SRC}/." "${APT_DIR}/usr/lib/" | indent
+arrow "copied libmsodbcsql-${MS_ODBC_VERSION}-* from $(basename "${LIB_SRC}")/"
+
+RESOURCES_SRC="${ODBC_PKG_DIR}/share/resources/en_US"
+if [ -d "${RESOURCES_SRC}" ]; then
+  cp -a "${RESOURCES_SRC}/." "${APT_DIR}/usr/share/resources/en_US/" | indent
+  arrow "copied msodbcsqlr${MS_ODBC_VERSION}.rll"
+else
+  arrow "WARNING: ${RESOURCES_SRC} not found, skipping resource strings (driver will still work)"
+fi
 
 mkdir -p "${BUILD_DIR}/.profile.d" | indent
-cp .profile.d/configure-odbc.sh "${BUILD_DIR}/.profile.d" | indent
-arrow "copied profile.d"
+cp "$(dirname "$0")/../.profile.d/configure-odbc.sh" "${BUILD_DIR}/.profile.d/" | indent
+arrow "copied profile.d/configure-odbc.sh"
+
 arrow "Finished adding ODBC Driver ${MS_ODBC_VERSION} for SQL Server"

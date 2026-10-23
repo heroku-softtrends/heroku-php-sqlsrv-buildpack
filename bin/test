@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Test runner for this buildpack (see bin/test-compile for the fixture +
+# compile-invoking helper this calls into). No real Heroku app, .deb
+# package, or network access required — everything runs against fake
+# .apt/ trees in a scratch directory.
+#
+# Usage: bin/test
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BP_DIR="$(dirname "${SCRIPT_DIR}")"
+SCRATCH_ROOT="$(mktemp -d)"
+trap 'rm -rf "${SCRATCH_ROOT}"' EXIT
+
+PASS=0
+FAIL=0
+
+ok()  { PASS=$((PASS+1)); echo "  ok   - $*"; }
+bad() { FAIL=$((FAIL+1)); echo "  FAIL - $*"; }
+
+assert_eq() {
+  local desc="$1" expected="$2" actual="$3"
+  if [ "${expected}" = "${actual}" ]; then ok "${desc}"; else
+    bad "${desc} (expected [${expected}], got [${actual}])"
+  fi
+}
+
+assert_file_exists() {
+  local desc="$1" path="$2"
+  if [ -f "${path}" ]; then ok "${desc}"; else bad "${desc} (missing: ${path})"; fi
+}
+
+assert_file_missing() {
+  local desc="$1" path="$2"
+  if [ ! -f "${path}" ]; then ok "${desc}"; else bad "${desc} (should not exist: ${path})"; fi
+}
+
+echo "== Test 1: single driver version (18) =="
+BUILD_DIR=$("${BP_DIR}/bin/test-compile" "${SCRATCH_ROOT}/t1" 18 2>"${SCRATCH_ROOT}/t1.log")
+assert_file_exists "driver .so copied to .apt/usr/lib" "${BUILD_DIR}/.apt/usr/lib/libmsodbcsql-18.0.so.1.1"
+assert_file_exists "resource file copied" "${BUILD_DIR}/.apt/usr/share/resources/en_US/msodbcsqlr18.rll"
+assert_file_exists "configure-odbc.sh copied into .profile.d" "${BUILD_DIR}/.profile.d/configure-odbc.sh"
+
+echo "== Test 2: both 17 and 18 installed -> picks 18 (the higher version) =="
+BUILD_DIR=$("${BP_DIR}/bin/test-compile" "${SCRATCH_ROOT}/t2" 17 18 2>"${SCRATCH_ROOT}/t2.log")
+assert_file_exists "18.so chosen" "${BUILD_DIR}/.apt/usr/lib/libmsodbcsql-18.0.so.1.1"
+assert_file_missing "17.so correctly not copied" "${BUILD_DIR}/.apt/usr/lib/libmsodbcsql-17.0.so.1.1"
+
+echo "== Test 3: MSODBCSQL_VERSION=17 override forces the lower version =="
+BUILD_DIR=$("${BP_DIR}/bin/test-compile" "${SCRATCH_ROOT}/t3" 17 18 -- MSODBCSQL_VERSION=17 2>"${SCRATCH_ROOT}/t3.log")
+assert_file_exists "17.so chosen via override" "${BUILD_DIR}/.apt/usr/lib/libmsodbcsql-17.0.so.1.1"
+
+echo "== Test 4: missing msodbcsql install fails loudly, not silently =="
+mkdir -p "${SCRATCH_ROOT}/t4/build/.apt"
+set +e
+"${BP_DIR}/bin/compile" "${SCRATCH_ROOT}/t4/build" >"${SCRATCH_ROOT}/t4.log" 2>&1
+RC=$?
+set -e
+if [ "${RC}" -ne 0 ] && grep -q "not found" "${SCRATCH_ROOT}/t4.log"; then
+  ok "exits non-zero with a clear 'not found' message when msodbcsql wasn't installed"
+else
+  bad "expected non-zero exit + 'not found' message, got rc=${RC}: $(cat "${SCRATCH_ROOT}/t4.log")"
+fi
+
+echo "== Test 4b: .apt/opt/microsoft exists but has no msodbcsql<N> subdir =="
+# Distinct from Test 4: the directory itself exists this time, it's just
+# empty of any msodbcsql* subfolder. Under set -euo pipefail, a grep-based
+# version-discovery pipeline exits 1 on zero matches and aborts the script
+# before the "no msodbcsql<N> directory found" check is ever reached --
+# so without the sed-based fix, this case fails with NO error message at
+# all, which is worse than Test 4's case.
+mkdir -p "${SCRATCH_ROOT}/t4b/build/.apt/opt/microsoft"
+set +e
+"${BP_DIR}/bin/compile" "${SCRATCH_ROOT}/t4b/build" >"${SCRATCH_ROOT}/t4b.log" 2>&1
+RC=$?
+set -e
+if [ "${RC}" -ne 0 ] && grep -q "no msodbcsql<N> directory found" "${SCRATCH_ROOT}/t4b.log"; then
+  ok "exits non-zero with a clear error when microsoft/ exists but has no driver subdir"
+else
+  bad "expected non-zero exit + 'no msodbcsql<N> directory found' message, got rc=${RC}, output: [$(cat "${SCRATCH_ROOT}/t4b.log")]"
+fi
+
+echo "== Test 5: configure-odbc.sh ignores decoy files and sets up ini correctly =="
+BUILD_DIR=$("${BP_DIR}/bin/test-compile" "${SCRATCH_ROOT}/t5" 18 2>"${SCRATCH_ROOT}/t5.log")
+(
+  export HOME="${BUILD_DIR}"
+  # shellcheck disable=SC1091
+  source "${HOME}/.profile.d/configure-odbc.sh"
+  echo "${ODBCINI}" > "${SCRATCH_ROOT}/t5_odbcini.txt"
+)
+assert_eq "ODBCINI points at the odbc.ini FILE, not a directory" \
+  "${BUILD_DIR}/.apt/usr/lib/odbc/conf/odbc.ini" \
+  "$(cat "${SCRATCH_ROOT}/t5_odbcini.txt")"
+assert_file_exists "odbc.ini written" "${BUILD_DIR}/.apt/usr/lib/odbc/conf/odbc.ini"
+assert_file_exists "odbcinst.ini written" "${BUILD_DIR}/.apt/usr/lib/odbc/conf/odbcinst.ini"
+if grep -q "libmsodbcsql-18.0.so.1.1" "${BUILD_DIR}/.apt/usr/lib/odbc/conf/odbcinst.ini"; then
+  ok "odbcinst.ini references the real driver .so, not a decoy file"
+else
+  bad "odbcinst.ini does not reference the expected driver .so"
+fi
+
+echo "== Test 6: configure-odbc.sh warns (doesn't crash) when no driver is present =="
+T6="${SCRATCH_ROOT}/t6/build"
+mkdir -p "${T6}/.apt/usr/lib" "${T6}/.profile.d"
+touch "${T6}/.apt/usr/lib/some_unrelated_file.so"
+cp "${BP_DIR}/.profile.d/configure-odbc.sh" "${T6}/.profile.d/"
+(
+  export HOME="${T6}"
+  set +e
+  # shellcheck disable=SC1091
+  source "${HOME}/.profile.d/configure-odbc.sh" 2>"${SCRATCH_ROOT}/t6_warn.log"
+  set -e
+)
+if grep -q "WARNING" "${SCRATCH_ROOT}/t6_warn.log"; then
+  ok "prints a WARNING instead of crashing dyno boot when no driver is found"
+else
+  bad "expected a WARNING message, got: $(cat "${SCRATCH_ROOT}/t6_warn.log")"
+fi
+
+echo
+echo "== Syntax check all scripts =="
+for f in bin/compile bin/detect bin/release bin/test-compile .profile.d/configure-odbc.sh; do
+  if bash -n "${BP_DIR}/${f}" 2>/dev/null || sh -n "${BP_DIR}/${f}" 2>/dev/null; then
+    ok "${f} parses cleanly"
+  else
+    bad "${f} has a syntax error"
+  fi
+done
+
+echo
+echo "============================="
+echo "Passed: ${PASS}  Failed: ${FAIL}"
+echo "============================="
+[ "${FAIL}" -eq 0 ]

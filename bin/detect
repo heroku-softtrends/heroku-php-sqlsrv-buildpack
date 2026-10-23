@@ -1,3 +1,5 @@
-#!/bin/sh
+#!/usr/bin/env sh
+set -e
 
 echo "odbc"
+exit 0
